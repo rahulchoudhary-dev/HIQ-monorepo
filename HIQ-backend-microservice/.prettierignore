@@ -1,0 +1,30 @@
+# Node modules and dependencies
+node_modules
+package-lock.json
+yarn.lock
+
+# Build output
+dist
+build
+.next
+out
+
+# Logs
+*.log
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Public assets
+public
+coverage
+
+# Database and migration artifacts
+migrations
+seeders
+
+# Misc
+*.min.js
+*.min.css

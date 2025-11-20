@@ -1,0 +1,927 @@
+import { useState, useEffect, useContext } from "react";
+import { useParams, useNavigate } from "react-router-dom";
+import { supabase } from "@/lib/supabaseClient";
+import {
+  CheckCircle,
+  XCircle,
+  Clock,
+  FileText,
+  AlertCircle,
+  Loader2,
+  ArrowLeft,
+  Moon,
+  Sun,
+  LogOut,
+  ChevronDown,
+  ChevronUp,
+} from "lucide-react";
+import { useAuthSession } from "@/hooks/useAuthSession";
+import useCurrentUser from "@/hooks/useCurrentUser";
+import getStatusBadge from "@/components/getStatusBadge";
+import { ThemeContext } from '@/App.jsx';
+import { Button } from "@/components/ui/button";
+
+export default function ReportDetails() {
+  const { reportId } = useParams();
+  const navigate = useNavigate();
+  const [report, setReport] = useState(null);
+  const [domains, setDomains] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [processing, setProcessing] = useState(null);
+  const [error, setError] = useState(null);
+  const { currentUser } = useCurrentUser();
+  const [success, setSuccess] = useState(null);
+  const [currentUserId, setCurrentUserId] = useState(null);
+  const [showRejectModal, setShowRejectModal] = useState(false);
+  const [rejectReason, setRejectReason] = useState("");
+  const { theme, toggleTheme } = useContext(ThemeContext);
+  const [showAgentsOutput, setShowAgentsOutput] = useState(false);
+  const [agentsViewMode, setAgentsViewMode] = useState("text"); // 'text' or 'json'
+  const { userRole } = useAuthSession();
+  const isReviewer = userRole === "reviewer";
+
+  useEffect(() => {
+    if (theme === "dark") document.documentElement.classList.add("dark");
+    else document.documentElement.classList.remove("dark");
+  }, [theme]);
+
+  useEffect(() => {
+    getCurrentUser();
+    fetchReportAndDomains();
+  }, [reportId]);
+
+  // Redirect unless report is Completed (when loaded or via realtime)
+  useEffect(() => {
+    if (report && report.stage !== "Completed") {
+      navigate(isReviewer ? "/reviewer" : "/app", { replace: true });
+    }
+  }, [report, navigate]);
+
+  useEffect(() => {
+    if (!reportId) return;
+
+    console.log("⚡ Setting up realtime for report:", reportId);
+
+    const channel = supabase
+      .channel(`report_${reportId}`, {
+        config: {
+          broadcast: { self: true },
+          presence: { key: reportId },
+        },
+      })
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "Reports",
+          filter: `id=eq.${reportId}`,
+        },
+        (payload) => {
+          console.log("📥 Report change:", payload.eventType);
+          if (payload.eventType === "UPDATE") {
+            setReport((prev) => ({ ...prev, ...payload.new }));
+          }
+        }
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "Domains",
+          filter: `report_id=eq.${reportId}`,
+        },
+        (payload) => {
+          console.log(
+            "📥 Domain change:",
+            payload.eventType,
+            payload.new?.domain_name
+          );
+
+          if (payload.eventType === "UPDATE") {
+            setDomains((prev) =>
+              prev.map((domain) =>
+                domain.id === payload.new.id
+                  ? { ...domain, ...payload.new }
+                  : domain
+              )
+            );
+          } else if (payload.eventType === "INSERT") {
+            setDomains((prev) => [...prev, payload.new]);
+          } else if (payload.eventType === "DELETE") {
+            setDomains((prev) =>
+              prev.filter((domain) => domain.id !== payload.old.id)
+            );
+          }
+        }
+      )
+      .subscribe((status, err) => {
+        if (status === "SUBSCRIBED") {
+          console.log("✅ Successfully subscribed to report realtime");
+        } else if (status === "CHANNEL_ERROR") {
+          console.error("❌ Realtime error:", err);
+        } else if (status === "TIMED_OUT") {
+          console.error("⏱️ Realtime timed out");
+        } else if (status === "CLOSED") {
+          console.log("🔌 Realtime closed");
+        } else {
+          console.log("📡 Status:", status);
+        }
+      });
+
+    return () => {
+      console.log("🧹 Cleaning up report subscription");
+      supabase.removeChannel(channel);
+    };
+  }, [reportId]);
+
+  const getCurrentUser = async () => {
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (user) {
+      const { data } = await supabase
+        .from("users")
+        .select("id")
+        .eq("auth_user_id", user.id)
+        .single();
+      setCurrentUserId(data?.auth_user_id);
+    }
+  };
+
+  const fetchReportAndDomains = async () => {
+    try {
+      setLoading(true);
+      const { data: reportData, error: reportError } = await supabase
+        .from("Reports")
+        .select(
+          `
+    *,
+    uploaded_by_user:users!reports_uploaded_by_fkey(auth_user_id,email),
+    reviewed_by_user:users!reports_reviewed_by_fkey(auth_user_id,email),
+    site:sites(name, display_name)
+    `
+        )
+        .eq("id", reportId)
+        .single();
+
+      console.log("reportError", reportError);
+      if (reportError) throw reportError;
+
+      // Fetch domains separately
+      const { data: domainsData, error: domainsError } = await supabase
+        .from("Domains")
+        .select("*")
+        .eq("report_id", reportId)
+        .order("domain_name", { ascending: true });
+
+      if (domainsError) throw domainsError;
+
+      console.log("📊 Loaded report with", domainsData?.length || 0, "domains");
+
+      setReport(reportData);
+      setDomains(domainsData || []);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const updateReportStatus = async () => {
+    try {
+      const { data: latestDomains } = await supabase
+        .from("Domains")
+        .select("status")
+        .eq("report_id", reportId);
+
+      if (!latestDomains || latestDomains.length === 0) return;
+
+      const allApproved = latestDomains.every((d) => d.status === "approved");
+      const anyRejected = latestDomains.some((d) => d.status === "rejected");
+
+      let newStatus = "processing";
+      if (allApproved) {
+        newStatus = "Approved";
+      } else if (anyRejected) {
+        newStatus = "Rejected";
+      }
+
+      await supabase
+        .from("Reports")
+        .update({ status: newStatus })
+        .eq("id", reportId);
+    } catch (err) {
+      console.error("Error updating report status:", err);
+    }
+  };
+
+  const handleApproveDomain = async (domainId) => {
+    try {
+      setProcessing(`domain-${domainId}`);
+      setError(null);
+
+      const { error } = await supabase
+        .from("Domains")
+        .update({
+          status: "approved",
+          reviewed_by: currentUserId,
+          reviewed_at: new Date().toISOString(),
+        })
+        .eq("id", domainId);
+
+      if (error) throw error;
+
+      setSuccess("Domain approved!");
+      setTimeout(() => setSuccess(null), 2000);
+
+      await updateReportStatus();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setProcessing(null);
+    }
+  };
+
+  const handleRejectDomain = async (domainId, reason) => {
+    if (!reason.trim()) {
+      setError("Rejection reason is required");
+      return;
+    }
+
+    try {
+      setProcessing(`domain-${domainId}`);
+      setError(null);
+
+      const { error } = await supabase
+        .from("Domains")
+        .update({
+          status: "rejected",
+          rejection_reason: reason,
+          reviewed_by: currentUserId,
+          reviewed_at: new Date().toISOString(),
+        })
+        .eq("id", domainId);
+
+      if (error) throw error;
+
+      setSuccess("Domain rejected!");
+      setTimeout(() => setSuccess(null), 2000);
+
+      await updateReportStatus();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setProcessing(null);
+    }
+  };
+  console.log("currentUserId", currentUserId);
+
+  const handleApproveAll = async () => {
+    console.log("currentUserId", currentUser?.auth_user_id);
+
+    try {
+      setProcessing("approve-all");
+      setError(null);
+
+      const { error: domainError } = await supabase
+        .from("Domains")
+        .update({
+          status: "approved",
+          reviewed_by: currentUser?.auth_user_id,
+          reviewed_at: new Date().toISOString(),
+        })
+        .eq("report_id", reportId);
+
+      if (domainError) throw domainError;
+
+      const { error: reportError } = await supabase
+        .from("Reports")
+        .update({
+          status: "Approved",
+          reviewed_by: currentUser?.auth_user_id,
+          reviewed_at: new Date().toISOString(),
+        })
+        .eq("id", reportId);
+
+      if (reportError) throw reportError;
+
+      setSuccess("Report and all domains approved!");
+      setTimeout(() => setSuccess(null), 3000);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setProcessing(null);
+    }
+  };
+
+  const handleRejectAll = async () => {
+    if (!rejectReason.trim()) {
+      setError("Rejection reason is required");
+      return;
+    }
+
+    try {
+      setProcessing("reject-all");
+      setError(null);
+
+      const { error: domainError } = await supabase
+        .from("Domains")
+        .update({
+          status: "rejected",
+          rejection_reason: rejectReason,
+          reviewed_by: currentUserId,
+          reviewed_at: new Date().toISOString(),
+        })
+        .eq("report_id", reportId);
+
+      if (domainError) throw domainError;
+
+      const { error: reportError } = await supabase
+        .from("Reports")
+        .update({
+          status: "Rejected",
+          review_notes: rejectReason,
+          reviewed_by: currentUserId,
+          reviewed_at: new Date().toISOString(),
+        })
+        .eq("id", reportId);
+
+      if (reportError) throw reportError;
+
+      setSuccess("Report and all domains rejected!");
+      setShowRejectModal(false);
+      setRejectReason("");
+      setTimeout(() => setSuccess(null), 3000);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setProcessing(null);
+    }
+  };
+
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
+  };
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center">
+        <div className="text-center">
+          <Loader2 className="w-8 h-8 animate-spin text-muted-foreground mx-auto mb-2" />
+          <p className="text-sm text-muted-foreground">Loading report...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!report) {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center">
+        <div className="text-center">
+          <p className="text-muted-foreground mb-4">Report not found</p>
+          <button
+            onClick={() => navigate(isReviewer ? "/reviewer" : "/app")}
+            className="px-4 py-2 rounded-lg bg-black text-white hover:bg-black/90"
+          >
+            Go Back
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-background">
+      {/* Header */}
+      <header className="bg-card border-b border-border p-6">
+        <div className="max-w-[76rem] mx-auto flex justify-between items-center">
+          <div className="flex items-center gap-4">
+            <Button
+              onClick={() => navigate(isReviewer ? "/reviewer" : "/app")}
+              variant="ghost"
+              size="icon"
+              className="mr-2"
+            >
+              <ArrowLeft className="w-5 h-5" />
+            </Button>
+            <div>
+              <h1 className="text-2xl font-semibold text-foreground">
+                {report.fileName}
+              </h1>
+              <p className="text-sm text-muted-foreground">
+                {isReviewer
+                  ? "Review domains and approve/reject"
+                  : "View report detailsF and domain analysis"}
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={toggleTheme}
+              className="flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+            >
+              {theme === "light" ? <Moon className="w-4 h-4" /> : <Sun className="w-4 h-4" />}
+              <span className="text-sm">{theme === "light" ? "Dark Mode" : "Light Mode"}</span>
+            </button>
+            <button
+              onClick={handleLogout}
+              className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-red-600 border border-red-300 hover:bg-red-50 dark:border-red-700 dark:hover:bg-red-900/30 transition-colors"
+            >
+              <LogOut className="w-4 h-4" />
+              Logout
+            </button>
+          </div>
+        </div>
+      </header>
+
+      {/* Content */}
+      <main className="max-w-[76rem] mx-auto p-6 space-y-6">
+        {/* Alerts */}
+        {error && (
+          <div className="flex items-start gap-2 rounded-xl border border-red-200/60 bg-red-50/80 text-red-800 dark:border-red-900/50 dark:bg-red-950/40 dark:text-red-300 px-3 py-2">
+            <AlertCircle className="mt-0.5 shrink-0" size={18} />
+            <span className="text-sm">{error}</span>
+          </div>
+        )}
+
+        {success && (
+          <div className="flex items-start gap-2 rounded-xl border border-green-200/60 bg-green-50/80 text-green-800 dark:border-green-900/50 dark:bg-green-950/40 dark:text-green-300 px-3 py-2">
+            <CheckCircle className="mt-0.5 shrink-0" size={18} />
+            <span className="text-sm">{success}</span>
+          </div>
+        )}
+
+        {/* Report Info */}
+        <div className="bg-card/70 backdrop-blur-sm rounded-2xl border border-border p-6">
+          <div className="flex items-start gap-4">
+            <div className="p-3 bg-blue-100 dark:bg-blue-900/30 rounded-lg">
+              <FileText className="w-6 h-6 text-blue-600 dark:text-blue-400" />
+            </div>
+            <div className="flex-1">
+              <div className="flex items-center gap-2 mb-2">
+                <h2 className="text-xl font-semibold text-foreground">
+                  {report.fileName}
+                </h2>
+                {getStatusBadge(report.status)}
+              </div>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                <div>
+                  <p className="text-muted-foreground">Site</p>
+                  <p className="font-medium">{report.site?.display_name}</p>
+                </div>
+                <div>
+                  <p className="text-muted-foreground">Uploaded</p>
+                  <p className="font-medium">
+                    {new Date(report.uploadedAt).toLocaleDateString()}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-muted-foreground">Uploaded By</p>
+                  <p className="font-medium">
+                    {report.uploaded_by_user?.email || "N/A"}
+                  </p>
+                </div>
+              </div>
+              {report.agents_summary && (
+                <div className="mt-4 p-3 bg-muted/30 rounded-lg">
+                  <p className="text-sm text-muted-foreground mb-1">Summary</p>
+                  <p className="text-sm">{report.agents_summary}</p>
+                </div>
+              )}
+              {report.review_notes && report.status === "rejected" && (
+                <div className="mt-4 p-3 bg-red-50 dark:bg-red-900/20 rounded-lg border border-red-200 dark:border-red-900/50">
+                  <p className="text-sm font-medium text-red-800 dark:text-red-300">
+                    Review Notes:
+                  </p>
+                  <p className="text-sm text-red-700 dark:text-red-400 mt-1">
+                    {report.review_notes}
+                  </p>
+                </div>
+              )}
+              {report.reviewed_by_user && (
+                <div className="mt-4 flex items-center gap-2 text-sm text-muted-foreground">
+                  <span>Reviewed by:</span>
+                  <span className="font-medium text-foreground">
+                    {report.reviewed_by_user.email}
+                  </span>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+        {/* Agents Output Section */}
+        {report.result && (
+          <div className="bg-card/70 backdrop-blur-sm rounded-2xl border border-border overflow-hidden">
+            <div className="p-6 border-b border-border">
+              <div className="flex items-center justify-between">
+                <h3 className="text-lg font-semibold text-foreground">
+                  Agents Output
+                </h3>
+                <button
+                  onClick={() => setShowAgentsOutput(!showAgentsOutput)}
+                  className="p-2 rounded-lg hover:bg-muted transition-colors"
+                  title={
+                    showAgentsOutput
+                      ? "Hide Agents Output"
+                      : "Show Agents Output"
+                  }
+                >
+                  {showAgentsOutput ? (
+                    <ChevronUp className="w-5 h-5 text-muted-foreground" />
+                  ) : (
+                    <ChevronDown className="w-5 h-5 text-muted-foreground" />
+                  )}
+                </button>
+              </div>
+            </div>
+
+            {showAgentsOutput && (
+              <div className="p-6">
+                {/* 🔁 Parse result string into object */}
+                {(() => {
+                  let parsedResult = {};
+                  try {
+                    parsedResult =
+                      typeof report.result === "string"
+                        ? JSON.parse(report.result)
+                        : report.result;
+                  } catch (error) {
+                    console.error("Invalid result JSON:", error);
+                  }
+
+                  return (
+                    <>
+                      {/* Toggle for JSON/Text view */}
+                      <div className="flex items-center gap-2 mb-4">
+                        <p className="text-sm font-medium text-foreground">
+                          View Mode:
+                        </p>
+                        <div className="flex items-center gap-1 bg-muted/50 rounded-lg p-1">
+                          <button
+                            onClick={() => setAgentsViewMode("text")}
+                            className={`px-3 py-1 text-xs rounded-md transition-colors ${
+                              agentsViewMode === "text"
+                                ? "bg-background text-foreground shadow-sm"
+                                : "text-muted-foreground hover:text-foreground"
+                            }`}
+                          >
+                            Text
+                          </button>
+                          <button
+                            onClick={() => setAgentsViewMode("json")}
+                            className={`px-3 py-1 text-xs rounded-md transition-colors ${
+                              agentsViewMode === "json"
+                                ? "bg-background text-foreground shadow-sm"
+                                : "text-muted-foreground hover:text-foreground"
+                            }`}
+                          >
+                            JSON
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Agents Output Content */}
+                      <div className="space-y-4">
+                        {agentsViewMode === "text" &&
+                        parsedResult.plain_texts ? (
+                          Object.entries(parsedResult.plain_texts).map(
+                            ([agentName, content]) => (
+                              <div
+                                key={agentName}
+                                className="border border-border rounded-lg p-4"
+                              >
+                                <h4 className="text-sm font-semibold text-foreground mb-2 capitalize">
+                                  {agentName.replace(/_/g, " ")}
+                                </h4>
+                                <div className="bg-muted/30 rounded-lg p-3">
+                                  <p className="text-sm text-foreground whitespace-pre-wrap">
+                                    {content}
+                                  </p>
+                                </div>
+                              </div>
+                            )
+                          )
+                        ) : agentsViewMode === "json" && parsedResult.jsons ? (
+                          Object.entries(parsedResult.jsons).map(
+                            ([agentName, data]) => (
+                              <div
+                                key={agentName}
+                                className="border border-border rounded-lg p-4"
+                              >
+                                <h4 className="text-sm font-semibold text-foreground mb-2 capitalize">
+                                  {agentName.replace(/_/g, " ")}
+                                </h4>
+                                <div className="bg-muted/30 rounded-lg p-3 overflow-x-auto">
+                                  <pre className="text-xs text-foreground">
+                                    {JSON.stringify(data, null, 2)}
+                                  </pre>
+                                </div>
+                              </div>
+                            )
+                          )
+                        ) : (
+                          <p className="text-sm text-muted-foreground text-center py-4">
+                            No agents output available
+                          </p>
+                        )}
+                      </div>
+                    </>
+                  );
+                })()}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Action Buttons - Only show for reviewers */}
+        {isReviewer && (
+          <div className="flex items-center gap-3">
+            <button
+              onClick={handleApproveAll}
+              disabled={processing === "approve-all" || report.status === "Approved"}
+              className="inline-flex items-center gap-2 px-6 py-3 rounded-lg bg-green-600 text-white hover:bg-green-700 disabled:opacity-60 disabled:cursor-not-allowed transition-colors font-medium"
+            >
+              {processing === "approve-all" ? (
+                <Loader2 className="w-5 h-5 animate-spin" />
+              ) : (
+                <CheckCircle className="w-5 h-5" />
+              )}
+              Approve Report
+            </button>
+            <button
+              onClick={() => setShowRejectModal(true)}
+              disabled={processing === "reject-all" || report.status === "Rejected"}
+              className="inline-flex items-center gap-2 px-6 py-3 rounded-lg bg-red-600 text-white hover:bg-red-700 disabled:opacity-60 disabled:cursor-not-allowed transition-colors font-medium"
+            >
+              <XCircle className="w-5 h-5" />
+              Reject Report
+            </button>
+          </div>
+        )}
+
+        {/* Domains List */}
+        <div className="bg-card/70 backdrop-blur-sm rounded-2xl border border-border overflow-hidden">
+          <div className="p-6 border-b border-border">
+            <h3 className="text-lg font-semibold text-foreground">
+              Domains ({domains.length})
+            </h3>
+          </div>
+          {domains.length === 0 ? (
+            <div className="p-8 text-center text-muted-foreground">
+              No domains found for this report
+            </div>
+          ) : (
+            <div className="divide-y divide-border/50">
+              {domains.map((domain) => (
+                <DomainCard
+                  key={domain.id}
+                  domain={domain}
+                  onApprove={handleApproveDomain}
+                  onReject={handleRejectDomain}
+                  processing={processing === `domain-${domain.id}`}
+                  isReviewer={isReviewer}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      </main>
+
+      {/* Reject Modal */}
+      {showRejectModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div
+            className="absolute inset-0 bg-black/50 backdrop-blur-sm"
+            onClick={() => setShowRejectModal(false)}
+          />
+          <div className="relative bg-card border rounded-2xl shadow-xl max-w-md w-full p-6">
+            <h3 className="text-lg font-semibold mb-4">Reject All Domains</h3>
+            <p className="text-sm text-muted-foreground mb-4">
+              This will reject all domains and the entire report. Please provide
+              a reason.
+            </p>
+            <textarea
+              value={rejectReason}
+              onChange={(e) => setRejectReason(e.target.value)}
+              className="w-full px-3 py-2 border rounded-lg bg-background mb-4 focus:outline-none focus:ring-2 focus:ring-black dark:focus:ring-white"
+              rows={3}
+              placeholder="Enter rejection reason..."
+            />
+            <div className="flex gap-2">
+              <button
+                onClick={handleRejectAll}
+                disabled={!rejectReason.trim() || processing === "reject-all"}
+                className="flex-1 px-4 py-2 rounded-lg bg-red-600 text-white hover:bg-red-700 disabled:opacity-60 disabled:cursor-not-allowed"
+              >
+                {processing === "reject-all" ? (
+                  <Loader2 className="w-4 h-4 animate-spin mx-auto" />
+                ) : (
+                  "Reject All"
+                )}
+              </button>
+              <button
+                onClick={() => setShowRejectModal(false)}
+                disabled={processing === "reject-all"}
+                className="flex-1 px-4 py-2 rounded-lg border hover:bg-muted disabled:cursor-not-allowed"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DomainCard({ domain, onApprove, onReject, processing, isReviewer }) {
+  const [showReject, setShowReject] = useState(false);
+  const [reason, setReason] = useState("");
+  const [showJson, setShowJson] = useState(false);
+  const canApprove = domain.status !== "approved";
+  const canReject = domain.status !== "rejected";
+
+  const handleReject = () => {
+    onReject(domain.id, reason);
+    setShowReject(false);
+    setReason("");
+  };
+
+  return (
+    <div className="p-6 hover:bg-muted/30 transition">
+      <div className="flex items-start justify-between">
+        <div className="flex-1">
+          <div className="flex items-center gap-3 mb-2">
+            <h4 className="text-lg font-medium text-foreground">
+              {domain.domain_name}
+            </h4>
+            {domain.status === "pending" && (
+              <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-300">
+                <Clock size={12} />
+                Pending
+              </span>
+            )}
+            {domain.status === "approved" && (
+              <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300">
+                <CheckCircle size={12} />
+                Approved
+              </span>
+            )}
+            {domain.status === "rejected" && (
+              <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300">
+                <XCircle size={12} />
+                Rejected
+              </span>
+            )}
+          </div>
+
+          {domain?.domain_data && (
+            <div className="mb-3">
+              {/* Toggle for JSON/Text view */}
+              <div className="flex items-center gap-2 mb-3">
+                <p className="text-sm font-medium text-foreground">
+                  Domain Analysis:
+                </p>
+                <div className="flex items-center gap-1 bg-muted/50 rounded-lg p-1">
+                  <button
+                    onClick={() => setShowJson(false)}
+                    className={`px-3 py-1 text-xs rounded-md transition-colors ${
+                      !showJson
+                        ? "bg-background text-foreground shadow-sm"
+                        : "text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    Text
+                  </button>
+                  <button
+                    onClick={() => setShowJson(true)}
+                    className={`px-3 py-1 text-xs rounded-md transition-colors ${
+                      showJson
+                        ? "bg-background text-foreground shadow-sm"
+                        : "text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    JSON
+                  </button>
+                </div>
+              </div>
+
+              {/* Content based on toggle */}
+              {!showJson && domain.domain_data.domain_text ? (
+                <div className="bg-muted/30 rounded-lg p-3">
+                  <p className="text-sm text-foreground whitespace-pre-wrap">
+                    {domain?.domain_data?.domain_text}
+                  </p>
+                </div>
+              ) : showJson ? (
+                <div className="bg-muted/30 rounded-lg p-3 overflow-x-auto">
+                  <pre className="text-xs text-foreground">
+                    {JSON.stringify(domain.domain_data, null, 2)}
+                  </pre>
+                </div>
+              ) : (
+                <p className="text-sm text-muted-foreground">
+                  No domain analysis available
+                </p>
+              )}
+            </div>
+          )}
+
+          {domain.status === "rejected" && domain.rejection_reason && (
+            <div className="mb-3 p-3 bg-red-50 dark:bg-red-900/20 rounded-lg border border-red-200 dark:border-red-900/50">
+              <p className="text-sm font-medium text-red-800 dark:text-red-300">
+                Rejection Reason:
+              </p>
+              <p className="text-sm text-red-700 dark:text-red-400 mt-1">
+                {domain.rejection_reason}
+              </p>
+            </div>
+          )}
+
+          {domain.review_notes && (
+            <p className="text-sm text-muted-foreground mb-2">
+              <span className="font-medium">Notes:</span> {domain.review_notes}
+            </p>
+          )}
+
+          {domain.reviewed_at && (
+            <p className="text-xs text-muted-foreground">
+              Reviewed: {new Date(domain.reviewed_at).toLocaleDateString()} at{" "}
+              {new Date(domain.reviewed_at).toLocaleTimeString()}
+            </p>
+          )}
+        </div>
+
+        {/* Approve/Reject buttons - Only show for reviewers */}
+        {isReviewer && (
+          <div className="flex items-start gap-2 ml-4">
+            <button
+              onClick={() => {
+                if (!canApprove) return;
+                onApprove(domain.id);
+              }}
+              disabled={processing || !canApprove}
+              className="p-2 rounded-lg hover:bg-green-100 dark:hover:bg-green-900/30 text-green-600 dark:text-green-400 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              title="Approve domain"
+            >
+              {processing ? (
+                <Loader2 className="w-5 h-5 animate-spin" />
+              ) : (
+                <CheckCircle className="w-5 h-5" />
+              )}
+            </button>
+            <button
+              onClick={() => {
+                if (!canReject) return;
+                setShowReject(!showReject);
+              }}
+              disabled={processing || !canReject}
+              className="p-2 rounded-lg hover:bg-red-100 dark:hover:bg-red-900/30 text-red-600 dark:text-red-400 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              title="Reject domain"
+            >
+              <XCircle className="w-5 h-5" />
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Reject form - Only show for reviewers */}
+      {isReviewer && showReject && (
+        <div className="mt-4 pt-4 border-t border-border/50 space-y-3">
+          <div>
+            <label className="text-sm font-medium text-foreground mb-1 block">
+              Rejection Reason *
+            </label>
+            <textarea
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              className="w-full px-3 py-2 text-sm border border-border rounded-lg bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-black dark:focus:ring-white"
+              rows={3}
+              placeholder="Enter rejection reason..."
+            />
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={handleReject}
+              disabled={!reason.trim() || processing}
+              className="px-4 py-2 text-sm rounded-lg bg-red-600 text-white hover:bg-red-700 disabled:opacity-60 transition-colors"
+            >
+              Confirm Rejection
+            </button>
+            <button
+              onClick={() => {
+                setShowReject(false);
+                setReason("");
+              }}
+              className="px-4 py-2 text-sm rounded-lg border border-border hover:bg-muted transition-colors"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
